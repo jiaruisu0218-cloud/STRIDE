@@ -1,0 +1,43 @@
+# =============================================================================
+# STRIDE — Python dependencies
+# =============================================================================
+# Install (from repo root, with conda env `stride` activated):
+#   pip install -r requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.0.2+cu118
+
+# --- Runtime imports used under `codes/` ---
+# absl: logging in code_manipulation / buffer / sampler
+absl-py==2.3.1
+# HuggingFace local engine (see project README if you add llm_engine later)
+accelerate==0.27.2
+bitsandbytes==0.42.0
+huggingface-hub==0.20.3
+transformers==4.38.1
+# HTTP stack for ApiLLM / FastAPI-style tooling
+fastapi==0.110.0
+uvicorn==0.27.1
+flask==3.0.2
+flask-cors==4.0.0
+requests==2.32.5
+
+# --- Numerics & specs (evaluate + data loading) ---
+numpy==1.26.4
+scipy==1.12.0
+pandas==2.3.3
+matplotlib==3.10.7
+scikit-learn==1.8.0
+
+# --- Logging / profiling ---
+tensorboard==2.15.2
+
+# =============================================================================
+# Optional (uncomment if you use Numba acceleration in evaluator)
+# =============================================================================
+# Used by `codes/evaluate/evaluator_accelerate.py` when sandbox enables it.
+# Pair numba with a compatible llvmlite (see numba release notes).
+# numba==0.64.0
+# llvmlite==0.46.0

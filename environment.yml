@@ -1,0 +1,11 @@
+# Portable Conda env for STRIDE / LLM-SR style pipeline.
+# Create: conda env create -f environment.yml && conda activate stride
+name: stride
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - -r requirements.txt

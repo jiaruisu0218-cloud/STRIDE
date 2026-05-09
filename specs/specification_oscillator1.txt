@@ -1,0 +1,1397 @@
+"""
+Find the mathematical function skeleton that represents acceleration in a damped nonlinear oscillator system with driving force,
+given data on position, and velocity.
+"""
+from __future__ import annotations
+
+import ast
+import inspect
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from scipy.optimize import minimize
+
+try:
+    from scipy.optimize import lsq_linear
+    _HAS_LSQLIN = True
+except Exception:
+    _HAS_LSQLIN = False
+
+
+# ============================================================
+# User config
+# ============================================================
+MAX_NPARAMS = 10
+
+# Optimization
+N_RESTARTS = 4
+COARSE_TOL = 1e-5
+COARSE_MAXITER = 200  # e.g. 200
+
+# Bounds: if not None -> nonlinear uses L-BFGS-B
+PARAM_BOUNDS = None  # or list[(low, high)] length MAX_NPARAMS
+
+# Score (example: structure - complexity)
+W_STRUCT = 0.7
+W_COMP = 0.3
+
+# Complexity knobs (simple + stable)
+K_PARAM = 1.0
+K_SENS = 0.05
+K_CURVLOG = 0.01
+DEBUG_COMPLEXITY = True
+
+# If LIP detected: LS -> warm-start nonlinear refine (optional)
+DO_REFINE_AFTER_LS = True
+REFINE_REL_IMPROVE_EPS = 1e-8  # accept refine only if it truly improves NMSE
+
+# ============================================================
+# Mixed optimization: param classification
+# ============================================================
+NONLINEAR_FUNCS = {"sin", "cos", "tan", "exp", "log", "sqrt", "power"}
+
+
+def _subscript_index_from_slice(sl: ast.AST) -> Optional[int]:
+    """Parse integer index from Subscript.slice (Constant / Index / Num)."""
+    if sl is None:
+        return None
+    if isinstance(sl, ast.Constant) and isinstance(sl.value, int):
+        return int(sl.value)
+    if hasattr(ast, "Index") and isinstance(sl, ast.Index):
+        v = sl.value
+        if isinstance(v, ast.Constant) and isinstance(v.value, int):
+            return int(v.value)
+        if hasattr(ast, "Num") and isinstance(v, ast.Num) and isinstance(getattr(v, "n", None), (int, float)):
+            return int(v.n)
+    if hasattr(ast, "Num") and isinstance(sl, ast.Num) and isinstance(getattr(sl, "n", None), (int, float)):
+        return int(sl.n)
+    return None
+
+
+# ============================================================
+# Utilities: safe eval + behavior complexity
+# ============================================================
+def _safe_eval(eq, x, v, p):
+    try:
+        y = eq(x, v, np.asarray(p, dtype=float))
+        y = np.asarray(y, dtype=float).ravel()
+        if y.shape != x.shape or (not np.all(np.isfinite(y))):
+            return None
+        return y
+    except Exception:
+        return None
+
+
+def _sensitivity_cost(equation_func, x_small, v_small, params, eps=1e-4):
+    try:
+        y0 = equation_func(x_small, v_small, params)
+        yx = equation_func(x_small + eps, v_small, params)
+        yv = equation_func(x_small, v_small + eps, params)
+        if not (np.all(np.isfinite(y0)) and np.all(np.isfinite(yx)) and np.all(np.isfinite(yv))):
+            return 0.0
+        return float(np.mean(np.abs(yx - y0)) + np.mean(np.abs(yv - y0)))
+    except Exception:
+        return 0.0
+
+
+def _curvature_cost(equation_func, x_small, v_small, params, eps=1e-3):
+    try:
+        y0 = equation_func(x_small, v_small, params)
+        yx_p = equation_func(x_small + eps, v_small, params)
+        yx_m = equation_func(x_small - eps, v_small, params)
+        yv_p = equation_func(x_small, v_small + eps, params)
+        yv_m = equation_func(x_small, v_small - eps, params)
+        arrs = [y0, yx_p, yx_m, yv_p, yv_m]
+        if not all(np.all(np.isfinite(a)) for a in arrs):
+            return 0.0
+        d2x = np.mean(np.abs(yx_p - 2 * y0 + yx_m)) / (eps**2)
+        d2v = np.mean(np.abs(yv_p - 2 * y0 + yv_m)) / (eps**2)
+        return float(d2x + d2v)
+    except Exception:
+        return 0.0
+
+
+def _effective_param_count(
+    equation_func,
+    x_small,
+    v_small,
+    params,
+    eps=1e-4,
+    rel_thr=1e-6,
+    abs_thr=1e-10,
+):
+    """
+    Count the number of parameters that have a significant effect on the output.
+    Uses numerical perturbation to detect which parameters actually influence the function output.
+    """
+    p = np.asarray(params, dtype=float).copy()
+
+    try:
+        y0 = np.asarray(equation_func(x_small, v_small, p), dtype=float).ravel()
+    except Exception:
+        return 0
+
+    if not np.all(np.isfinite(y0)):
+        return 0
+
+    scale = float(np.std(y0))
+    if not np.isfinite(scale) or scale < 1e-12:
+        scale = 1.0
+
+    thr = max(abs_thr, rel_thr * scale)
+
+    cnt = 0
+    for i in range(len(p)):
+        p2 = p.copy()
+        step = eps * (1.0 + abs(p[i]))
+        p2[i] += step
+
+        try:
+            y1 = np.asarray(equation_func(x_small, v_small, p2), dtype=float).ravel()
+        except Exception:
+            continue
+
+        if y1.shape != y0.shape or not np.all(np.isfinite(y1)):
+            continue
+
+        delta = float(np.sqrt(np.mean((y1 - y0) ** 2)))
+        if delta > thr:
+            cnt += 1
+
+    return int(cnt)
+
+
+def _full_complexity(equation_func, x, v, params):
+    """
+    Calculate full complexity including effective parameter count and behavior complexity.
+    """
+    n = min(len(x), 300)
+    x_s = np.asarray(x[:n], dtype=float)
+    v_s = np.asarray(v[:n], dtype=float)
+    
+    # Calculate effective parameter count
+    try:
+        n_eff = _effective_param_count(equation_func, x[:200], v[:200], params)
+    except Exception:
+        n_eff = 0
+    
+    # Calculate behavior complexity (sensitivity + curvature)
+    c_sens = _sensitivity_cost(equation_func, x_s, v_s, params)
+    c_curv = _curvature_cost(equation_func, x_s, v_s, params)
+    c_behav = float(K_SENS * c_sens + K_CURVLOG * np.log1p(c_curv))
+    
+    C = float(K_PARAM * n_eff + c_behav)
+    if DEBUG_COMPLEXITY:
+        print("[Complexity] n_eff=", n_eff, "c_behavior=", c_behav, "C=", C)
+    return C
+
+
+# ============================================================
+# AST-based LIP extraction
+#   Goal: represent return as base(x,v) + sum_i coeff[i](x,v)*p_i
+# ============================================================
+
+_ALLOWED_NP_FUNCS = {
+    "sin", "cos", "exp", "log", "sqrt", "tanh", "abs", "sign"
+}
+
+
+@dataclass(frozen=True)
+class LinearExpr:
+    """base(x,v) + sum_i coeff[i](x,v)*p_i"""
+    base: ast.AST
+    coeff: Dict[int, ast.AST]  # params index -> ast expr in x,v only
+
+    def has_params(self) -> bool:
+        return len(self.coeff) > 0
+
+
+def _ast_is_name(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _ast_is_np_call(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if isinstance(node.func.value, ast.Name) and node.func.value.id == "np":
+            fn = node.func.attr
+            if fn in _ALLOWED_NP_FUNCS:
+                return fn
+    return None
+
+
+def _is_params_subscript_index(node: ast.AST) -> Optional[int]:
+    """Match params[<int>]"""
+    if not isinstance(node, ast.Subscript):
+        return None
+    if not _ast_is_name(node.value, "params"):
+        return None
+
+    s = node.slice
+    if isinstance(s, ast.Constant) and isinstance(s.value, int):
+        return int(s.value)
+    if hasattr(ast, "Index") and isinstance(s, ast.Index) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, int):
+        return int(s.value.value)
+    return None
+
+
+def _is_params_slice(node: ast.AST) -> Optional[Tuple[Optional[int], Optional[int], Optional[int]]]:
+    """Match params[start:stop:step] ; returns (start, stop, step) if matched."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    if not _ast_is_name(node.value, "params"):
+        return None
+    s = node.slice
+    if isinstance(s, ast.Slice):
+        start = s.lower.value if isinstance(s.lower, ast.Constant) and isinstance(s.lower.value, int) else None
+        stop = s.upper.value if isinstance(s.upper, ast.Constant) and isinstance(s.upper.value, int) else None
+        step = s.step.value if isinstance(s.step, ast.Constant) and isinstance(s.step.value, int) else None
+        return (start, stop, step)
+    # Python <3.9 may wrap Slice in Index
+    if hasattr(ast, "Index") and isinstance(s, ast.Index) and isinstance(s.value, ast.Slice):
+        sl = s.value
+        start = sl.lower.value if isinstance(sl.lower, ast.Constant) and isinstance(sl.lower.value, int) else None
+        stop = sl.upper.value if isinstance(sl.upper, ast.Constant) and isinstance(sl.upper.value, int) else None
+        step = sl.step.value if isinstance(sl.step, ast.Constant) and isinstance(sl.step.value, int) else None
+        return (start, stop, step)
+    return None
+
+
+def _ensure_paramfree(le: LinearExpr) -> ast.AST:
+    if le.has_params():
+        raise ValueError("Nonlinear-in-params: params appear inside nonlinearity")
+    return le.base
+
+
+def _lin_add(a: LinearExpr, b: LinearExpr) -> LinearExpr:
+    base = ast.BinOp(left=a.base, op=ast.Add(), right=b.base)
+    coeff = dict(a.coeff)
+    for k, v in b.coeff.items():
+        coeff[k] = ast.BinOp(left=coeff[k], op=ast.Add(), right=v) if k in coeff else v
+    return LinearExpr(base=base, coeff=coeff)
+
+
+def _lin_sub(a: LinearExpr, b: LinearExpr) -> LinearExpr:
+    base = ast.BinOp(left=a.base, op=ast.Sub(), right=b.base)
+    coeff = dict(a.coeff)
+    for k, v in b.coeff.items():
+        coeff[k] = ast.BinOp(left=coeff[k], op=ast.Sub(), right=v) if k in coeff else ast.UnaryOp(op=ast.USub(), operand=v)
+    return LinearExpr(base=base, coeff=coeff)
+
+
+def _lin_neg(a: LinearExpr) -> LinearExpr:
+    base = ast.UnaryOp(op=ast.USub(), operand=a.base)
+    coeff = {k: ast.UnaryOp(op=ast.USub(), operand=v) for k, v in a.coeff.items()}
+    return LinearExpr(base=base, coeff=coeff)
+
+
+def _lin_mul(a: LinearExpr, b: LinearExpr) -> LinearExpr:
+    if a.has_params() and b.has_params():
+        raise ValueError("Nonlinear-in-params: product of parameter-dependent terms")
+    if a.has_params():
+        b0 = b.base
+        base = ast.BinOp(left=a.base, op=ast.Mult(), right=b0)
+        coeff = {k: ast.BinOp(left=v, op=ast.Mult(), right=b0) for k, v in a.coeff.items()}
+        return LinearExpr(base=base, coeff=coeff)
+    if b.has_params():
+        a0 = a.base
+        base = ast.BinOp(left=a0, op=ast.Mult(), right=b.base)
+        coeff = {k: ast.BinOp(left=a0, op=ast.Mult(), right=v) for k, v in b.coeff.items()}
+        return LinearExpr(base=base, coeff=coeff)
+    return LinearExpr(base=ast.BinOp(left=a.base, op=ast.Mult(), right=b.base), coeff={})
+
+
+def _lin_div(a: LinearExpr, b: LinearExpr) -> LinearExpr:
+    if b.has_params():
+        raise ValueError("Nonlinear-in-params: params in denominator")
+    b0 = b.base
+    base = ast.BinOp(left=a.base, op=ast.Div(), right=b0)
+    coeff = {k: ast.BinOp(left=v, op=ast.Div(), right=b0) for k, v in a.coeff.items()}
+    return LinearExpr(base=base, coeff=coeff)
+
+
+def _lin_pow(a: LinearExpr, b: LinearExpr) -> LinearExpr:
+    if a.has_params() or b.has_params():
+        raise ValueError("Nonlinear-in-params: params in pow")
+    return LinearExpr(base=ast.BinOp(left=a.base, op=ast.Pow(), right=b.base), coeff={})
+
+
+def _lin_from_node(node: ast.AST, env: Dict[str, LinearExpr]) -> LinearExpr:
+    if isinstance(node, ast.Constant):
+        return LinearExpr(base=node, coeff={})
+
+    if isinstance(node, ast.Name):
+        if node.id in ("x", "v", "np"):
+            return LinearExpr(base=node, coeff={})
+        if node.id in env:
+            return env[node.id]
+        raise ValueError(f"Unknown symbol '{node.id}'")
+
+    idx = _is_params_subscript_index(node)
+    if idx is not None:
+        if idx < 0 or idx >= MAX_NPARAMS:
+            raise ValueError("params index out of range")
+        return LinearExpr(base=ast.Constant(value=0.0), coeff={idx: ast.Constant(value=1.0)})
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return _lin_neg(_lin_from_node(node.operand, env))
+
+    if isinstance(node, ast.BinOp):
+        a = _lin_from_node(node.left, env)
+        b = _lin_from_node(node.right, env)
+        if isinstance(node.op, ast.Add):
+            return _lin_add(a, b)
+        if isinstance(node.op, ast.Sub):
+            return _lin_sub(a, b)
+        if isinstance(node.op, ast.Mult):
+            return _lin_mul(a, b)
+        if isinstance(node.op, ast.Div):
+            return _lin_div(a, b)
+        if isinstance(node.op, ast.Pow):
+            return _lin_pow(a, b)
+        raise ValueError("Unsupported operator")
+
+    fn = _ast_is_np_call(node)
+    if fn is not None:
+        if len(node.args) != 1 or len(node.keywords) != 0:
+            raise ValueError("Only unary np.func(arg) supported")
+        arg = _lin_from_node(node.args[0], env)
+        arg0 = _ensure_paramfree(arg)
+        return LinearExpr(base=ast.Call(func=node.func, args=[arg0], keywords=[]), coeff={})
+
+    raise ValueError(f"Unsupported AST node: {type(node).__name__}")
+
+
+@dataclass
+class LipModel:
+    lip: bool
+    active_idx: List[int]
+    base_expr: Optional[ast.AST] = None
+    coeff_exprs: Optional[Dict[int, ast.AST]] = None
+    base_fn: Optional[callable] = None
+    coeff_fns: Optional[Dict[int, callable]] = None
+
+
+_LIP_CACHE: Optional[LipModel] = None
+_LIP_CACHE_KEY: Optional[int] = None
+# Pre-create a default non-LIP model to avoid scope issues
+try:
+    _DEFAULT_NONLIP_MODEL = LipModel(lip=False, active_idx=[], base_expr=None, coeff_exprs=None, base_fn=None, coeff_fns=None)
+except NameError:
+    # If LipModel is not yet defined, set to None and create lazily
+    _DEFAULT_NONLIP_MODEL = None
+
+def _get_default_nonlip_model():
+    """Get or create a default non-LIP model."""
+    global _DEFAULT_NONLIP_MODEL
+    if _DEFAULT_NONLIP_MODEL is None:
+        try:
+            # Try to access LipModel from current scope or globals
+            try:
+                LipModel_cls = LipModel
+            except NameError:
+                LipModel_cls = globals().get('LipModel')
+            
+            if LipModel_cls is not None:
+                _DEFAULT_NONLIP_MODEL = LipModel_cls(lip=False, active_idx=[], base_expr=None, coeff_exprs=None, base_fn=None, coeff_fns=None)
+            else:
+                raise NameError("LipModel not found")
+        except (NameError, KeyError, TypeError):
+            # If LipModel is still not available, create a simple namespace object
+            from types import SimpleNamespace
+            _DEFAULT_NONLIP_MODEL = SimpleNamespace(
+                lip=False,
+                active_idx=[],
+                base_expr=None,
+                coeff_exprs=None,
+                base_fn=None,
+                coeff_fns=None
+            )
+    return _DEFAULT_NONLIP_MODEL
+
+
+def _compile_expr(expr: ast.AST) -> callable:
+    tree = ast.Expression(body=expr)
+    ast.fix_missing_locations(tree)
+    codeobj = compile(tree, filename="<ast>", mode="eval")
+
+    def f(x, v):
+        return eval(codeobj, {"np": np, "x": x, "v": v})
+
+    return f
+
+
+def _extract_lip_from_equation(eq_func) -> LipModel:
+    """
+    Parse equation() source, handle:
+      - simple assigns name = expr
+      - tuple-unpack: a,b,c = params[:k]
+      - return expr
+    """
+    if DEBUG_COMPLEXITY:
+        print(f"[LIP Extraction] Starting extraction for function: {eq_func.__name__}")
+    try:
+        src = inspect.getsource(eq_func)
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Got source code ({len(src)} chars)")
+    except Exception as e:
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Failed to get source: {type(e).__name__}: {e}")
+        return _get_default_nonlip_model()
+
+    try:
+        mod = ast.parse(src)
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] AST parsed successfully. Body has {len(mod.body)} nodes")
+    except Exception as e:
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Failed to parse AST: {type(e).__name__}: {e}")
+        return _get_default_nonlip_model()
+
+    fdef = None
+    for n in mod.body:
+        if isinstance(n, ast.FunctionDef) and n.name == eq_func.__name__:
+            fdef = n
+            break
+    if fdef is None:
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Function '{eq_func.__name__}' not found in AST")
+        return _get_default_nonlip_model()
+    
+    if DEBUG_COMPLEXITY:
+        print(f"[LIP Extraction] Found function definition. Body has {len(fdef.body)} statements")
+
+    env: Dict[str, LinearExpr] = {}
+
+    def bind_name_to_param(name: str, p_index: int):
+        if p_index < 0 or p_index >= MAX_NPARAMS:
+            raise ValueError("params index out of range in unpack")
+        env[name] = LinearExpr(base=ast.Constant(value=0.0), coeff={p_index: ast.Constant(value=1.0)})
+
+    ret_expr = None
+
+    if DEBUG_COMPLEXITY:
+        print(f"[LIP Extraction] Processing {len(fdef.body)} statements in function body")
+    
+    for stmt_idx, stmt in enumerate(fdef.body):
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Processing statement {stmt_idx+1}/{len(fdef.body)}: {type(stmt).__name__}")
+        # docstring
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+            if DEBUG_COMPLEXITY:
+                print(f"[LIP Extraction] Skipping docstring: {stmt.value.value[:50]}...")
+            continue
+
+        # tuple unpack from params slice: a,b,c = params[:k]
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Tuple):
+            tgt = stmt.targets[0]
+            sl = _is_params_slice(stmt.value)
+            if sl is None:
+                if DEBUG_COMPLEXITY:
+                    print(f"[LIP Extraction] Tuple unpack but not from params slice")
+                return _get_default_nonlip_model()
+            start, stop, step = sl
+            if step not in (None, 1):
+                return _get_default_nonlip_model()
+            if start is None:
+                start = 0
+            if stop is None:
+                return _get_default_nonlip_model()
+            names = []
+            for elt in tgt.elts:
+                if not isinstance(elt, ast.Name):
+                    return _get_default_nonlip_model()
+                names.append(elt.id)
+            if len(names) != (stop - start):
+                # mismatch length => ambiguous
+                return _get_default_nonlip_model()
+            for j, nm in enumerate(names):
+                bind_name_to_param(nm, start + j)
+            continue
+
+        # normal assign: name = expr
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            name = stmt.targets[0].id
+            if DEBUG_COMPLEXITY:
+                try:
+                    import ast as ast_module
+                    expr_str = ast_module.unparse(stmt.value) if hasattr(ast_module, 'unparse') else str(type(stmt.value))
+                    print(f"[LIP Extraction] Processing assignment: {name} = {expr_str[:100]}")
+                except:
+                    pass
+            try:
+                le = _lin_from_node(stmt.value, env)
+                if DEBUG_COMPLEXITY:
+                    print(f"[LIP Extraction] Successfully parsed '{name}'. Has params: {le.has_params()}, coeff keys: {list(le.coeff.keys())}")
+            except Exception as e:
+                if DEBUG_COMPLEXITY:
+                    print(f"[LIP Extraction] Failed to parse assignment '{name} = ...': {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                return _get_default_nonlip_model()
+            env[name] = le
+            continue
+
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            name = stmt.target.id
+            try:
+                le = _lin_from_node(stmt.value, env)
+            except Exception as e:
+                if DEBUG_COMPLEXITY:
+                    print(f"[LIP Extraction] Failed to parse annotated assignment '{name} = ...': {type(e).__name__}: {e}")
+                return _get_default_nonlip_model()
+            env[name] = le
+            continue
+
+        if isinstance(stmt, ast.Return):
+            ret_expr = stmt.value
+            if DEBUG_COMPLEXITY:
+                try:
+                    import ast as ast_module
+                    ret_str = ast_module.unparse(ret_expr) if hasattr(ast_module, 'unparse') else str(type(ret_expr))
+                    print(f"[LIP Extraction] Found return statement: return {ret_str[:100]}")
+                except:
+                    print(f"[LIP Extraction] Found return statement")
+            break
+
+        # any control flow etc. => non-LIP
+        if not isinstance(stmt, ast.Pass):
+            if DEBUG_COMPLEXITY:
+                print(f"[LIP Extraction] Unsupported statement type: {type(stmt).__name__} at line {getattr(stmt, 'lineno', 'unknown')}")
+                if hasattr(stmt, 'lineno'):
+                    import ast
+                    print(f"[LIP Extraction] Statement code: {ast.unparse(stmt) if hasattr(ast, 'unparse') else 'N/A'}")
+            return _get_default_nonlip_model()
+
+    if ret_expr is None:
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] No return statement found")
+        return _get_default_nonlip_model()
+
+    try:
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Parsing return expression. Current env keys: {list(env.keys())}")
+        le_ret = _lin_from_node(ret_expr, env)
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Return expression parsed. Has params: {le_ret.has_params()}, coeff keys: {list(le_ret.coeff.keys())}")
+    except Exception as e:
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Failed to parse return expression: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+        return _get_default_nonlip_model()
+
+    active_idx = sorted(le_ret.coeff.keys())
+
+    if DEBUG_COMPLEXITY:
+        print(f"[LIP Extraction] Successfully extracted LIP model. Active indices: {active_idx}")
+
+    try:
+        base_fn = _compile_expr(le_ret.base)
+        coeff_fns = {i: _compile_expr(expr) for i, expr in le_ret.coeff.items()}
+    except Exception as e:
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction] Failed to compile expressions: {type(e).__name__}: {e}")
+        return _get_default_nonlip_model()
+
+    return LipModel(
+        lip=True,
+        active_idx=active_idx,
+        base_expr=le_ret.base,
+        coeff_exprs=le_ret.coeff,
+        base_fn=base_fn,
+        coeff_fns=coeff_fns,
+    )
+
+
+def _get_lip_model(eq_func) -> LipModel:
+    global _LIP_CACHE, _LIP_CACHE_KEY
+
+    try:
+        src = inspect.getsource(eq_func)
+        key = hash(src)
+    except Exception:
+        # If we can't read source, disable caching and just return non-LIP
+        try:
+            return _get_default_nonlip_model()
+        except Exception:
+            # Final fallback: create a simple namespace object
+            from types import SimpleNamespace
+            return SimpleNamespace(lip=False, active_idx=[], base_expr=None, coeff_exprs=None, base_fn=None, coeff_fns=None)
+
+    try:
+        if (_LIP_CACHE is None) or (_LIP_CACHE_KEY != key):
+            if DEBUG_COMPLEXITY:
+                print(f"[LIP Cache] Cache miss or key changed. Extracting LIP model...")
+            _LIP_CACHE = _extract_lip_from_equation(eq_func)
+            _LIP_CACHE_KEY = key
+            if DEBUG_COMPLEXITY:
+                print(f"[LIP Cache] Extraction complete. Result: lip={_LIP_CACHE.lip}, active_idx={getattr(_LIP_CACHE, 'active_idx', [])}")
+        else:
+            if DEBUG_COMPLEXITY:
+                print(f"[LIP Cache] Using cached result: lip={_LIP_CACHE.lip}, active_idx={getattr(_LIP_CACHE, 'active_idx', [])}")
+
+        return _LIP_CACHE
+    except Exception as e:
+        # If extraction fails, return non-LIP model
+        if DEBUG_COMPLEXITY:
+            print(f"[LIP Extraction Failed] {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+        try:
+            return _get_default_nonlip_model()
+        except Exception:
+            # Final fallback: create a simple namespace object
+            from types import SimpleNamespace
+            return SimpleNamespace(lip=False, active_idx=[], base_expr=None, coeff_exprs=None, base_fn=None, coeff_fns=None)
+
+
+# ============================================================
+# Mixed optimization (linear/nonlinear parameter separation)
+# ============================================================
+
+def _extract_param_indices_from_ast(node: ast.AST, alias_to_idx: Optional[Dict[str, int]] = None) -> List[int]:
+    idxs = []
+    class _V(ast.NodeVisitor):
+        def visit_Subscript(self, n):
+            if isinstance(n.value, ast.Name) and n.value.id in {"params", "p", "P", "w"}:
+                idx = _subscript_index_from_slice(n.slice)
+                if idx is not None:
+                    idxs.append(idx)
+            self.generic_visit(n)
+        def visit_Name(self, n):
+            if alias_to_idx and isinstance(n.ctx, ast.Load) and n.id in alias_to_idx:
+                idxs.append(alias_to_idx[n.id])
+            self.generic_visit(n)
+    _V().visit(node)
+    return idxs
+
+def _classify_params_linear_vs_nonlinear(func_src: str, param_dim: int) -> Tuple[List[int], List[int]]:
+    """
+    Heuristic:
+    - If params[i] appears inside sin/cos/exp/log/sqrt/power or as exponent => nonlinear
+    - If params[i] ever multiplies another param => nonlinear
+    - Else treat as "candidate linear"
+    """
+    class ParamUsageVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.param_positions = {}
+            self._in_call = 0
+            self._in_pow_exp = 0
+            self._in_mul_with_param = 0
+            self._alias_to_idx = {}
+            self._var_defs = {}
+            self._expanding = set()
+
+        def _tag(self, idx: int, tag: str):
+            self.param_positions.setdefault(idx, []).append(tag)
+
+        def _resolve_param_index(self, node: ast.AST) -> Optional[int]:
+            if isinstance(node, ast.Subscript):
+                base = node.value
+                if isinstance(base, ast.Name) and base.id in {"params", "p", "P", "w"}:
+                    idx = _subscript_index_from_slice(node.slice)
+                    if idx is not None:
+                        return idx
+            if isinstance(node, ast.Name) and node.id in self._alias_to_idx:
+                return self._alias_to_idx[node.id]
+            if isinstance(node, ast.IfExp):
+                idx = self._resolve_param_index(node.body)
+                if idx is not None:
+                    return idx
+                return self._resolve_param_index(node.orelse)
+            return None
+
+        def _register_alias(self, target: ast.AST, value: ast.AST):
+            if isinstance(target, ast.Name):
+                idx = self._resolve_param_index(value)
+                if idx is not None:
+                    self._alias_to_idx[target.id] = idx
+
+        def _is_params_slice(self, node: ast.AST) -> Optional[Tuple[int, int, Optional[int]]]:
+            if not isinstance(node, ast.Subscript):
+                return None
+            base = node.value
+            if not isinstance(base, ast.Name) or base.id not in {"params", "p", "P", "w"}:
+                return None
+            sl = node.slice
+            if not isinstance(sl, ast.Slice):
+                return None
+            start = stop = step = None
+            if sl.lower is not None:
+                if isinstance(sl.lower, ast.Constant) and isinstance(sl.lower.value, int):
+                    start = int(sl.lower.value)
+                elif hasattr(ast, "Index") and isinstance(sl.lower, ast.Index) and isinstance(sl.lower.value, ast.Constant) and isinstance(sl.lower.value.value, int):
+                    start = int(sl.lower.value.value)
+            if sl.upper is not None:
+                if isinstance(sl.upper, ast.Constant) and isinstance(sl.upper.value, int):
+                    stop = int(sl.upper.value)
+                elif hasattr(ast, "Index") and isinstance(sl.upper, ast.Index) and isinstance(sl.upper.value, ast.Constant) and isinstance(sl.upper.value.value, int):
+                    stop = int(sl.upper.value.value)
+            if sl.step is not None:
+                if isinstance(sl.step, ast.Constant) and isinstance(sl.step.value, int):
+                    step = int(sl.step.value)
+                elif hasattr(ast, "Index") and isinstance(sl.step, ast.Index) and isinstance(sl.step.value, ast.Constant) and isinstance(sl.step.value.value, int):
+                    step = int(sl.step.value.value)
+            return (start, stop, step)
+
+        def visit_Assign(self, node: ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple):
+                tgt = node.targets[0]
+                sl = self._is_params_slice(node.value)
+                if sl is not None:
+                    start, stop, step = sl
+                    if step not in (None, 1):
+                        self.generic_visit(node)
+                        return
+                    if start is None:
+                        start = 0
+                    if stop is None:
+                        self.generic_visit(node)
+                        return
+                    names = [elt.id for elt in tgt.elts if isinstance(elt, ast.Name)]
+                    if len(names) == (stop - start):
+                        for j, nm in enumerate(names):
+                            self._alias_to_idx[nm] = start + j
+                        self.generic_visit(node)
+                        return
+            for t in node.targets:
+                self._register_alias(t, node.value)
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                if name not in self._alias_to_idx:
+                    self._var_defs[name] = node.value
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign):
+            if node.value is not None:
+                self._register_alias(node.target, node.value)
+            self.generic_visit(node)
+
+        def visit_Subscript(self, node: ast.Subscript):
+            base = node.value
+            if isinstance(base, ast.Name) and base.id in {"params", "p", "P", "w"}:
+                idx = _subscript_index_from_slice(node.slice)
+                if idx is not None:
+                    if self._in_call > 0:
+                        self._tag(idx, "in_nonlinear_call")
+                    if self._in_pow_exp > 0:
+                        self._tag(idx, "in_pow_exponent")
+                    if self._in_mul_with_param > 0:
+                        self._tag(idx, "mul_with_param")
+                    self._tag(idx, "used")
+            self.generic_visit(node)
+
+        def visit_Name(self, node: ast.Name):
+            if isinstance(node.ctx, ast.Load) and node.id in self._alias_to_idx:
+                idx = self._alias_to_idx[node.id]
+                if self._in_call > 0:
+                    self._tag(idx, "in_nonlinear_call")
+                if self._in_pow_exp > 0:
+                    self._tag(idx, "in_pow_exponent")
+                if self._in_mul_with_param > 0:
+                    self._tag(idx, "mul_with_param")
+                self._tag(idx, "used")
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call):
+            fn_name = None
+            if isinstance(node.func, ast.Attribute):
+                fn_name = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                fn_name = node.func.id
+            if fn_name in NONLINEAR_FUNCS:
+                self._in_call += 1
+                for arg in node.args:
+                    self.visit(arg)
+                    if isinstance(arg, ast.Name) and arg.id in self._var_defs and arg.id not in self._expanding:
+                        self._expanding.add(arg.id)
+                        try:
+                            self.visit(self._var_defs[arg.id])
+                        finally:
+                            self._expanding.discard(arg.id)
+                self._in_call -= 1
+                for kw in node.keywords:
+                    self.visit(kw.value)
+            else:
+                self.generic_visit(node)
+
+        def visit_BinOp(self, node: ast.BinOp):
+            if isinstance(node.op, ast.Pow):
+                self.visit(node.left)
+                self._in_pow_exp += 1
+                self.visit(node.right)
+                self._in_pow_exp -= 1
+                return
+            if isinstance(node.op, ast.Mult):
+                left_params = set(_extract_param_indices_from_ast(node.left, self._alias_to_idx))
+                right_params = set(_extract_param_indices_from_ast(node.right, self._alias_to_idx))
+                if left_params and right_params:
+                    self._in_mul_with_param += 1
+                    self.visit(node.left)
+                    self.visit(node.right)
+                    self._in_mul_with_param -= 1
+                    return
+            self.generic_visit(node)
+
+    try:
+        tree = ast.parse(func_src)
+        v = ParamUsageVisitor()
+        # Walk equation body in AST so params[i] inside the function is not missed.
+        if isinstance(tree, ast.Module) and len(tree.body) == 1 and isinstance(tree.body[0], ast.FunctionDef):
+            fdef = tree.body[0]
+            if fdef.name == "equation":
+                for stmt in fdef.body:
+                    v.visit(stmt)
+            else:
+                v.visit(tree)
+        else:
+            v.visit(tree)
+
+        nonlinear = set()
+        used = set()
+
+        for i, tags in v.param_positions.items():
+            used.add(i)
+            if any(t in {"in_nonlinear_call", "in_pow_exponent", "mul_with_param"} for t in tags):
+                nonlinear.add(i)
+
+        # Any unused indices: ignore
+        linear = sorted([i for i in used if i not in nonlinear])
+
+        if len(v.param_positions) == 0 and func_src:
+            print(f"[Param Classification Debug] No param_positions after visit. func_src snippet: {repr(func_src[:400])}")
+
+        # if no nonlinear detected but model still could be nonlinear, we'll fall back to pure BFGS later.
+        return linear, sorted(list(nonlinear))
+    except Exception as e:
+        # If AST parsing fails, treat all params as potentially nonlinear (conservative approach)
+        if func_src:
+            print(f"[Param Classification Debug] AST/classify failed: {type(e).__name__}: {e}")
+        return [], []
+
+def _extract_equation_source_from_program(program_str: str) -> Optional[str]:
+    """
+    Extract equation() source from program text (fallback if inspect.getsource fails).
+    """
+    if program_str is None:
+        return None
+    try:
+        import ast
+        tree = ast.parse(program_str)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "equation":
+                # Python 3.9+: ast.unparse
+                if hasattr(ast, 'unparse'):
+                    return ast.unparse(node)
+                # Python 3.8: slice lines from source text
+                else:
+                    try:
+                        lines = program_str.splitlines()
+                        start_line = node.lineno - 1  # lineno is 1-based
+                        end_line = node.end_lineno if hasattr(node, 'end_lineno') else start_line + 1
+                        # All lines of the function definition
+                        func_lines = lines[start_line:end_line]
+                        return '\n'.join(func_lines)
+                    except Exception:
+                        return None
+    except Exception as e:
+        if DEBUG_COMPLEXITY:
+            print(f"[Extract Source] Failed to parse program: {e}")
+        return None
+    return None
+
+def _inner_ls_via_probes(eq, x, v, y, linear_idx: List[int], fixed_params: np.ndarray, ridge: float = 1e-10):
+    """
+    Given fixed full params vector (for nonlinear params + baseline),
+    solve for linear params in linear_idx via least squares using numeric probes.
+    """
+    # Handle empty linear_idx
+    if len(linear_idx) == 0:
+        return None, None
+    
+    try:
+        y = np.asarray(y, dtype=float).ravel()
+        p0 = np.asarray(fixed_params, dtype=float).copy()
+
+        # bias = f(all linear params set to 0)
+        p_bias = p0.copy()
+        for i in linear_idx:
+            p_bias[i] = 0.0
+        bias = _safe_eval(eq, x, v, p_bias)
+        if bias is None:
+            return None, None
+
+        # build Phi columns by toggling each linear param to 1
+        Phi = np.zeros((len(x), len(linear_idx)), dtype=float)
+        for k, i in enumerate(linear_idx):
+            p_k = p_bias.copy()
+            p_k[i] = 1.0
+            y_k = _safe_eval(eq, x, v, p_k)
+            if y_k is None:
+                return None, None
+            Phi[:, k] = (y_k - bias)
+
+        # solve: y - bias = Phi @ theta
+        rhs = y - bias
+        if ridge > 0:
+            A = Phi.T @ Phi + ridge * np.eye(Phi.shape[1])
+            b = Phi.T @ rhs
+            theta = np.linalg.solve(A, b)
+        else:
+            theta, *_ = np.linalg.lstsq(Phi, rhs, rcond=None)
+
+        # recover full params
+        p_full = p_bias.copy()
+        for k, i in enumerate(linear_idx):
+            p_full[i] = float(theta[k])
+
+        yhat = bias + Phi @ theta
+        return p_full, yhat
+    except Exception:
+        return None, None
+
+def _solve_mixed_opt(eq, x, v, y, active_idx, bounds_active=None):
+    """
+    Mixed optimization: outer optimize nonlinear params, inner solve linear params by LS probes.
+    Also runs full BFGS and returns the better result (lower NMSE).
+    
+    Returns:
+        tuple: (q_best, mse_best, method_name) where method_name is "MIXED" or "BFGS"
+    """
+    try:
+        y = np.asarray(y, dtype=float).ravel()
+        target_var = float(np.var(y))
+        if not np.isfinite(target_var) or target_var < 1e-12:
+            target_var = 1.0
+
+        def run_bfgs_full():
+            def loss_full(p):
+                p_full = np.zeros(MAX_NPARAMS, dtype=float)
+                for jj, ii in enumerate(active_idx):
+                    p_full[ii] = p[jj]
+                yp = _safe_eval(eq, x, v, p_full)
+                if yp is None:
+                    return 1e10
+                return float(np.mean((yp - y) ** 2))
+
+            method = "BFGS"
+            bounds = None
+            if bounds_active is not None:
+                method = "L-BFGS-B"
+                bounds = bounds_active
+
+            best_fun = np.inf
+            best_q = None
+
+            init_list = [np.zeros(len(active_idx), dtype=float)]
+            for _ in range(N_RESTARTS):
+                init_list.append(np.random.uniform(-0.5, 0.5, size=len(active_idx)))
+
+            for q0 in init_list:
+                try:
+                    res = minimize(
+                        loss_full,
+                        q0,
+                        method=method,
+                        bounds=bounds,
+                        tol=COARSE_TOL if method == "BFGS" else None,
+                        options={"maxiter": COARSE_MAXITER} if method == "BFGS" else {"maxiter": COARSE_MAXITER or 1500},
+                    )
+                    if np.isfinite(res.fun) and res.fun < best_fun and np.all(np.isfinite(res.x)):
+                        best_fun = float(res.fun)
+                        best_q = res.x
+                except Exception:
+                    continue
+
+            if best_q is None:
+                return None, np.inf
+
+            p_full = np.zeros(MAX_NPARAMS, dtype=float)
+            for jj, ii in enumerate(active_idx):
+                p_full[ii] = best_q[jj]
+            yhat = _safe_eval(eq, x, v, p_full)
+            if yhat is None:
+                return None, np.inf
+            nmse_val = float(np.mean((yhat - y) ** 2) / target_var)
+            return p_full, nmse_val
+
+        def _return_bfgs_or_fail():
+            p_bfgs, nmse_bfgs = run_bfgs_full()
+            if p_bfgs is None or not np.isfinite(nmse_bfgs):
+                return None, np.inf, "BFGS"
+            q_opt = np.array([p_bfgs[ii] for ii in active_idx], dtype=float)
+            mse_opt = float(nmse_bfgs * target_var)
+            return q_opt, mse_opt, "BFGS"
+
+        # Get function source for parameter classification
+        func_src = None
+
+        try:
+            func_src = inspect.getsource(eq)
+            print(f"[Mixed Optimization] Successfully got function source via inspect.getsource ({len(func_src)} chars)")
+        except Exception as e1:
+            try:
+                program_str = globals().get('__PROGRAM_SOURCE__', None)
+                if program_str:
+                    func_src = _extract_equation_source_from_program(program_str)
+                    if func_src:
+                        print(f"[Mixed Optimization] Got function source from program string ({len(func_src)} chars)")
+                    else:
+                        print(f"[Mixed Optimization] Could not extract equation from program string, trying conservative strategy")
+                else:
+                    print(f"[Mixed Optimization] __PROGRAM_SOURCE__ not found in globals, trying conservative strategy")
+            except Exception as e2:
+                print(f"[Mixed Optimization] Failed to get source from program: {type(e2).__name__}: {e2}, trying conservative strategy")
+
+        # If we still don't have source, use conservative strategy: assume all params are linear
+        if func_src is None:
+            print(f"[Mixed Optimization] Using conservative strategy: assuming all active parameters are linear")
+            # Conservative: assume all active parameters are linear, try LS via probes
+            linear_idx = list(active_idx)
+            nonlinear_idx = []
+            print(f"[Mixed Optimization] Conservative classification: linear_idx={linear_idx}, nonlinear_idx={nonlinear_idx}")
+            
+            # Try LS via probes with all params as linear
+            try:
+                p_init = np.zeros(MAX_NPARAMS, dtype=float)
+                p_full, yhat = _inner_ls_via_probes(eq, x, v, y, linear_idx, p_init, ridge=1e-10)
+                if p_full is not None and yhat is not None:
+                    ls_mse = float(np.mean((yhat - y) ** 2))
+                    ls_nmse = ls_mse / target_var
+                    print(f"[Mixed Optimization] Conservative LS via probes completed. NMSE: {ls_nmse:.6e}, MSE: {ls_mse:.6e}")
+                    
+                    # Compare with BFGS
+                    print(f"[Mixed Optimization] Running BFGS for comparison...")
+                    bfgs_params, bfgs_nmse = run_bfgs_full()
+                    if bfgs_params is None:
+                        print(f"[Mixed Optimization] BFGS failed, using conservative LS result")
+                        q_best = np.array([p_full[ii] for ii in active_idx], dtype=float)
+                        return q_best, ls_mse, "MIXED"
+                    
+                    print(f"[Mixed Optimization] BFGS completed. NMSE: {bfgs_nmse:.6e}")
+                    if bfgs_nmse < ls_nmse:
+                        print(f"[Mixed Optimization] BFGS is better (NMSE: {bfgs_nmse:.6e} < {ls_nmse:.6e}), using BFGS result")
+                        q_best = np.array([bfgs_params[ii] for ii in active_idx], dtype=float)
+                        mse_best = bfgs_nmse * target_var
+                        return q_best, mse_best, "BFGS"
+                    print(f"[Mixed Optimization] Conservative LS is better (NMSE: {ls_nmse:.6e} < {bfgs_nmse:.6e}), using LS result")
+                    q_best = np.array([p_full[ii] for ii in active_idx], dtype=float)
+                    return q_best, ls_mse, "MIXED"
+            except Exception as e3:
+                print(f"[Mixed Optimization] Conservative LS failed: {type(e3).__name__}: {e3}, falling back to BFGS")
+            
+            return _return_bfgs_or_fail()
+
+        # Classify parameters
+        try:
+            linear_idx, nonlinear_idx = _classify_params_linear_vs_nonlinear(func_src, MAX_NPARAMS)
+            print(f"[Mixed Optimization] Parameter classification: linear_idx={linear_idx}, nonlinear_idx={nonlinear_idx}")
+        except Exception as e:
+            print(f"[Mixed Optimization] Parameter classification failed: {type(e).__name__}: {e}")
+            return _return_bfgs_or_fail()
+    except Exception:
+        return None, np.inf, "BFGS"
+    # Only consider active indices
+    try:
+        linear_idx = [i for i in linear_idx if i in active_idx]
+        nonlinear_idx = [i for i in nonlinear_idx if i in active_idx]
+        print(f"[Mixed Optimization] After filtering by active_idx: linear_idx={linear_idx}, nonlinear_idx={nonlinear_idx}")
+    except Exception as e:
+        print(f"[Mixed Optimization] Filtering failed: {type(e).__name__}: {e}")
+        return _return_bfgs_or_fail()
+
+    # If no params are detected as linear or nonlinear, fall back to full BFGS.
+    if len(linear_idx) == 0 and len(nonlinear_idx) == 0:
+        print(f"[Mixed Optimization] No parameters detected (linear_idx={linear_idx}, nonlinear_idx={nonlinear_idx}), falling back to BFGS")
+        p_best, nmse_best = run_bfgs_full()
+        if p_best is None:
+            return None, np.inf, "BFGS"
+        q_best = np.array([p_best[ii] for ii in active_idx], dtype=float)
+        mse_best = nmse_best * target_var
+        return q_best, mse_best, "BFGS"
+
+    # if no nonlinear params, just do one inner LS with all fixed zeros
+    if len(nonlinear_idx) == 0:
+        print(f"[Mixed Optimization] All parameters are linear (linear_idx={linear_idx}), using LS via probes")
+        try:
+            p_init = np.zeros(MAX_NPARAMS, dtype=float)
+            p_full, yhat = _inner_ls_via_probes(eq, x, v, y, linear_idx, p_init, ridge=1e-10)
+            if p_full is None:
+                p_best, nmse_best = run_bfgs_full()
+                if p_best is None:
+                    return None, np.inf, "BFGS"
+                q_best = np.array([p_best[ii] for ii in active_idx], dtype=float)
+                mse_best = nmse_best * target_var
+                return q_best, mse_best, "BFGS"
+
+            ls_mse = float(np.mean((yhat - y) ** 2))
+            ls_nmse = ls_mse / target_var
+            print(f"[Mixed Optimization] LS via probes completed. NMSE: {ls_nmse:.6e}, MSE: {ls_mse:.6e}")
+
+            print(f"[Mixed Optimization] Running BFGS for comparison...")
+            bfgs_params, bfgs_nmse = run_bfgs_full()
+            if bfgs_params is None:
+                print(f"[Mixed Optimization] BFGS failed, using LS result")
+                q_best = np.array([p_full[ii] for ii in active_idx], dtype=float)
+                return q_best, ls_mse, "MIXED"  # LS result
+
+            print(f"[Mixed Optimization] BFGS completed. NMSE: {bfgs_nmse:.6e}")
+            if bfgs_nmse < ls_nmse:
+                print(f"[Mixed Optimization] BFGS is better (NMSE: {bfgs_nmse:.6e} < {ls_nmse:.6e}), using BFGS result")
+                q_best = np.array([bfgs_params[ii] for ii in active_idx], dtype=float)
+                mse_best = bfgs_nmse * target_var
+                return q_best, mse_best, "BFGS"  # BFGS is better
+            print(f"[Mixed Optimization] LS is better (NMSE: {ls_nmse:.6e} < {bfgs_nmse:.6e}), using LS result")
+            q_best = np.array([p_full[ii] for ii in active_idx], dtype=float)
+            return q_best, ls_mse, "MIXED"  # LS is better
+        except Exception:
+            # If LS fails, fallback to BFGS
+            p_best, nmse_best = run_bfgs_full()
+            if p_best is None:
+                return None, np.inf, "BFGS"
+            q_best = np.array([p_best[ii] for ii in active_idx], dtype=float)
+            mse_best = nmse_best * target_var
+            return q_best, mse_best, "BFGS"
+
+    # objective over q (nonlinear subset)
+    # This is the main mixed optimization path: Powell for nonlinear params, LS probes for linear params
+    print(f"[Mixed Optimization] Using mixed optimization: Powell for nonlinear_idx={nonlinear_idx}, LS probes for linear_idx={linear_idx}")
+    
+    def pack(p_full: np.ndarray) -> np.ndarray:
+        return np.array([p_full[i] for i in nonlinear_idx], dtype=float)
+
+    def unpack(q: np.ndarray, base: np.ndarray) -> np.ndarray:
+        p = base.copy()
+        for k, i in enumerate(nonlinear_idx):
+            p[i] = float(q[k])
+        return p
+
+    def obj(q: np.ndarray) -> float:
+        base = np.zeros(MAX_NPARAMS, dtype=float)
+        p_fixed = unpack(q, base)
+        try:
+            p_full, yhat = _inner_ls_via_probes(eq, x, v, y, linear_idx, p_fixed, ridge=1e-10)
+            if p_full is None or yhat is None:
+                return 1e10
+            return float(np.mean((yhat - y) ** 2) / target_var)
+        except Exception:
+            return 1e10
+
+    best_val = np.inf
+    best_params = None
+
+    # multi-start
+    rng = np.random.default_rng(0)
+    for r in range(N_RESTARTS):
+        if r == 0:
+            q0 = np.zeros(len(nonlinear_idx), dtype=float)
+        else:
+            # generic small random init
+            q0 = rng.uniform(-0.5, 0.5, size=len(nonlinear_idx))
+
+        try:
+            res = minimize(obj, q0, method="Powell", options={"maxiter": 400})
+            q_best = res.x if res.success else q0
+            val = float(obj(q_best))
+            if np.isfinite(val) and val < best_val:
+                best_val = val
+                # build full params at q_best
+                base = np.zeros(MAX_NPARAMS, dtype=float)
+                p_fixed = unpack(q_best, base)
+                p_full, _ = _inner_ls_via_probes(eq, x, v, y, linear_idx, p_fixed, ridge=1e-10)
+                if p_full is not None:
+                    best_params = p_full
+        except Exception:
+            continue
+
+    if best_params is None:
+        # fallback: pure BFGS on full vector (last resort)
+        try:
+            p_best, nmse_best = run_bfgs_full()
+            if p_best is None:
+                return None, np.inf, "BFGS"
+            q_best = np.array([p_best[ii] for ii in active_idx], dtype=float)
+            mse_best = nmse_best * target_var
+            return q_best, mse_best, "BFGS"
+        except Exception:
+            return None, np.inf, "BFGS"
+
+    try:
+        mixed_mse = best_val * target_var
+        print(f"[Mixed Optimization] Mixed optimization completed. NMSE: {best_val:.6e}, MSE: {mixed_mse:.6e}")
+
+        # Compare with BFGS
+        print(f"[Mixed Optimization] Running BFGS for comparison...")
+        bfgs_params, bfgs_nmse = run_bfgs_full()
+        if bfgs_params is None:
+            print(f"[Mixed Optimization] BFGS failed, using mixed optimization result")
+            q_best = np.array([best_params[ii] for ii in active_idx], dtype=float)
+            return q_best, mixed_mse, "MIXED"  # Mixed optimization result
+
+        print(f"[Mixed Optimization] BFGS completed. NMSE: {bfgs_nmse:.6e}")
+        if bfgs_nmse < best_val:
+            print(f"[Mixed Optimization] BFGS is better (NMSE: {bfgs_nmse:.6e} < {best_val:.6e}), using BFGS result")
+            q_best = np.array([bfgs_params[ii] for ii in active_idx], dtype=float)
+            mse_best = bfgs_nmse * target_var
+            return q_best, mse_best, "BFGS"  # BFGS is better
+
+        print(f"[Mixed Optimization] Mixed optimization is better (NMSE: {best_val:.6e} < {bfgs_nmse:.6e}), using mixed optimization result")
+        q_best = np.array([best_params[ii] for ii in active_idx], dtype=float)
+        return q_best, mixed_mse, "MIXED"  # Mixed optimization is better
+    except Exception:
+        # If comparison fails, return mixed result
+        q_best = np.array([best_params[ii] for ii in active_idx], dtype=float)
+        mixed_mse = best_val * target_var
+        return q_best, mixed_mse, "MIXED"
+
+# ============================================================
+# LS & Nonlinear optimization
+# ============================================================
+def _solve_lip_ls_from_ast(lip_model: LipModel, x, v, y, bounds_active=None):
+    """
+    Analytic Phi:
+      y = y0 + Phi @ q
+    where q corresponds to params[active_idx].
+    """
+    assert lip_model.lip and lip_model.base_fn and lip_model.coeff_fns
+
+    y0 = np.asarray(lip_model.base_fn(x, v), dtype=float).ravel()
+    if y0.shape != y.shape or not np.all(np.isfinite(y0)):
+        return None, np.inf, None, None
+
+    active_idx = lip_model.active_idx
+    k = len(active_idx)
+    Phi = np.zeros((len(x), k), dtype=float)
+
+    for j, i in enumerate(active_idx):
+        col = np.asarray(lip_model.coeff_fns[i](x, v), dtype=float).ravel()
+        if col.shape != y.shape or not np.all(np.isfinite(col)):
+            return None, np.inf, None, None
+        Phi[:, j] = col
+
+    rhs = (y - y0)
+
+    if bounds_active is not None and _HAS_LSQLIN:
+        lo = np.array([(-np.inf if b[0] is None else b[0]) for b in bounds_active], dtype=float)
+        hi = np.array([( np.inf if b[1] is None else b[1]) for b in bounds_active], dtype=float)
+        res = lsq_linear(Phi, rhs, bounds=(lo, hi), lsmr_tol="auto", verbose=0)
+        q = res.x
+    else:
+        q, *_ = np.linalg.lstsq(Phi, rhs, rcond=None)
+
+    yhat = y0 + Phi @ q
+    mse = float(np.mean((yhat - y) ** 2))
+    return q, mse, y0, Phi
+
+
+# ============================================================
+# evaluate.run (AST-based LIP routing)
+# ============================================================
+@evaluate.run
+def evaluate(data: dict) -> tuple:
+    try:
+        # -------------------------
+        # Load data
+        # -------------------------
+        if isinstance(data, dict) and "data" in data:
+            inputs  = np.asarray(data["data"]["inputs"], dtype=float)
+            outputs = np.asarray(data["data"]["outputs"], dtype=float).ravel()
+        else:
+            inputs  = np.asarray(data["inputs"], dtype=float)
+            outputs = np.asarray(data["outputs"], dtype=float).ravel()
+
+        if inputs.ndim != 2 or inputs.shape[1] < 2:
+            return -1e10, [0.0] * MAX_NPARAMS
+
+        x = inputs[:, 0]
+        v = inputs[:, 1]
+        y = outputs
+
+        target_var = float(np.var(y))
+        if not np.isfinite(target_var) or target_var < 1e-12:
+            target_var = 1.0
+
+        # -------------------------
+        # Use mixed optimization for all equations (like mixed_fit_generic.py)
+        # Parameter classification is more robust than full LIP extraction
+        # -------------------------
+        active_idx = list(range(MAX_NPARAMS))
+        if PARAM_BOUNDS is not None:
+            if len(PARAM_BOUNDS) != MAX_NPARAMS:
+                raise ValueError("PARAM_BOUNDS must have length MAX_NPARAMS")
+            bounds_active = PARAM_BOUNDS
+        else:
+            bounds_active = None
+
+        best_params = np.zeros(MAX_NPARAMS, dtype=float)
+        best_mse = np.inf
+        # Log label: MIXED | BFGS | FALLBACK
+        chosen = "FALLBACK"
+
+        # _solve_mixed_opt already picks mixed vs BFGS; no second _solve_nonlip_opt
+        try:
+            q_mixed, mse_mixed, method_name = _solve_mixed_opt(equation, x, v, y, active_idx=active_idx, bounds_active=bounds_active)
+
+            if q_mixed is not None and np.isfinite(mse_mixed) and mse_mixed < np.inf:
+                for jj, ii in enumerate(active_idx):
+                    best_params[ii] = q_mixed[jj]
+                best_mse = float(mse_mixed)
+                chosen = method_name if method_name in ("MIXED", "BFGS") else "BFGS"
+            else:
+                best_params = np.zeros(MAX_NPARAMS, dtype=float)
+                y_pred = _safe_eval(equation, x, v, best_params)
+                if y_pred is None:
+                    return -1e10, [0.0] * MAX_NPARAMS
+                best_mse = float(np.mean((y_pred - y) ** 2))
+                chosen = "FALLBACK"
+        except Exception:
+            best_params = np.zeros(MAX_NPARAMS, dtype=float)
+            y_pred = _safe_eval(equation, x, v, best_params)
+            if y_pred is None:
+                return -1e10, [0.0] * MAX_NPARAMS
+            best_mse = float(np.mean((y_pred - y) ** 2))
+            chosen = "FALLBACK"
+
+        # Score = structure - complexity
+        nmse = best_mse / target_var
+        S1 = -float(np.log(nmse + 1e-12))
+        # Calculate complexity using effective parameter count
+        C = _full_complexity(equation, x, v, best_params)
+        score = float(W_STRUCT * S1 - W_COMP * C)
+
+        if DEBUG_COMPLEXITY:
+            print(f"[Route] chosen={chosen} nmse={nmse:.3e}")
+
+        params_out = best_params.tolist()
+        if len(params_out) != MAX_NPARAMS:
+            params_out = (params_out + [0.0] * MAX_NPARAMS)[:MAX_NPARAMS]
+
+        # Return tuple: index 2 may be method name for profile; last = train NMSE (early-stop)
+        print(f"Param opt   : {chosen}")
+        return score, params_out, chosen, float(nmse)
+
+    except Exception as e:
+        # If any exception occurs during evaluation, return a low score
+        # This ensures the program is still registered (even with a bad score)
+        # rather than causing the entire evaluation to fail
+        import traceback
+        print(f"[ERROR in evaluate] {type(e).__name__}: {e}")
+        if DEBUG_COMPLEXITY:
+            traceback.print_exc()
+        return -1e10, [0.0] * MAX_NPARAMS
+
+@equation.evolve
+def equation(x: np.ndarray, v: np.ndarray, params: np.ndarray) -> np.ndarray:
+    """ Mathematical function for acceleration in a damped nonlinear oscillator
+
+    Args:
+        x: A numpy array representing observations of current position.
+        v: A numpy array representing observations of velocity.
+        params: Array of numeric constants or parameters to be optimized
+
+    Return:
+        A numpy array representing acceleration as the result of applying the mathematical function to the inputs.
+    """
+    dv = params[0] * x + params[1] * v + params[2]
+    return dv
