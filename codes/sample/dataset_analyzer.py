@@ -1,4 +1,4 @@
-﻿# dataset_analyzer.py
+# dataset_analyzer.py
 # ------------------------------------------------------------
 # Usage:
 #   1) Modify DATA_PATH below
