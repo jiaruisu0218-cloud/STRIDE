@@ -31,7 +31,7 @@ STRIDE addresses these issues with a role-based self-reflective workflow. A gene
   <img src="./fig/1_motivation.png" alt="STRIDE motivation" width="100%">
 </p>
 
-The motivation figure compares a generation-centered LLM-SR-style loop with STRIDE. STRIDE uses mixed fitting to better evaluate candidate potential, self-refinement to repair near-miss equations, and semantic memory to preserve structurally useful hypotheses instead of only retaining short-term score winners.
+As illustrated in the motivation figure, current generation-centered pipelines usually proceed by proposing equation skeletons, fitting their parameters, scoring the fitted candidates, storing experience according to those scores, and later retrieving examples from score-based clusters, often favoring shorter skeletons within equally scored groups. This design creates several failure modes: useful skeletons may be discarded when unreliable parameter fitting underestimates their potential; near-correct equations may be abandoned rather than locally repaired; and complex but informative hypotheses may be lost under short-term fitness or length bias. These limitations suggest that reliable LLM-based equation discovery should be organized as a multi-role reflective agent workflow, where generation, evaluation, critique, repair, and memory updating are distinct but coordinated roles.
 
 ## Framework
 
@@ -48,11 +48,11 @@ STRIDE organizes automatic equation discovery into four coordinated roles:
 
 ## Key Features
 
-- 📊 **Data-aware sampling**: extracts lightweight hints from the training data, including scale statistics, bias tendency, symmetry cues, and dominant feature terms.
-- 🧮 **Mixed parameter fitting**: separates linear and nonlinear/coupled parameters where possible, solves linear weights with least-squares probes, and keeps BFGS/L-BFGS-B as a fallback.
-- 🛠️ **Critic-executor repair**: reflects on promising but imperfect equations using fitted scores and parameters, then rewrites candidates through constrained edit actions.
-- 🧭 **Semantic memory**: stores diverse high-scoring equations in a multi-island buffer using canonicalized TF-IDF similarity instead of only score signatures.
-- 🧪 **Benchmark-ready specs**: includes representative LLM-SR tasks and LSR-Synth-style suites for oscillator, biology, chemistry, and materials-science cases.
+- 📊 **Data-aware sampling**: The generator agent builds prompts from task instructions, retrieved elite cases, and data hints extracted from the training set, including scale statistics, bias tendency, parity patterns, and dominant candidate terms.
+- 🧮 **Mixed parameter fitting**: The evaluator parses each candidate skeleton, separates linear coefficients from nonlinear or coupled parameters, solves the inner linear fit under outer nonlinear search, and returns fitted parameters with NMSE/complexity feedback.
+- 🛠️ **Critic-executor repair**: For promising but imperfect candidates, STRIDE triggers a critic to diagnose fitted behavior and propose local edit actions; the executor converts these actions into executable refinements for re-evaluation.
+- 🧭 **Semantic memory**: After evaluation or repair, selected equations are canonicalized, encoded with TF-IDF signatures, assigned to semantic clusters, and retained as diverse elite exemplars for later prompts.
+- 🧪 **Benchmark-ready specs**: The repository packages executable specifications and datasets for representative LLM-SR tasks and LSR-Synth-style domains, enabling direct runs on oscillator, biology, chemistry, and materials-science cases.
 
 ## Installation
 
