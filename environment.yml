@@ -1,4 +1,3 @@
-# Portable Conda env for STRIDE / LLM-SR style pipeline.
 # Create: conda env create -f environment.yml && conda activate stride
 name: stride
 channels:
