@@ -4,8 +4,6 @@
 
 STRIDE discovers compact symbolic equations from data with an LLM-guided, feedback-driven search loop. It extends the LLM-SR-style generate-fit-score-memory pipeline with data-aware sampling, mixed parameter fitting, critic-executor repair, and diversity-preserving semantic memory.
 
-Developed from the [LLM-SR](https://arxiv.org/abs/2404.18400) codebase.
-
 ## 📜 Content
 
 - [Overview](#overview)
