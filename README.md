@@ -28,7 +28,7 @@ STRIDE addresses these issues with a role-based self-reflective workflow. A gene
 ## Motivation
 
 <p align="center">
-  <img src="./fig/1_motivation.png" alt="STRIDE motivation" width="100%">
+  <img src="./fig/1_motivation.png" alt="STRIDE motivation" width="70%">
 </p>
 
 As illustrated in the motivation figure, current generation-centered pipelines usually proceed by proposing equation skeletons, fitting their parameters, scoring the fitted candidates, storing experience according to those scores, and later retrieving examples from score-based clusters, often favoring shorter skeletons within equally scored groups. This design creates several failure modes: useful skeletons may be discarded when unreliable parameter fitting underestimates their potential; near-correct equations may be abandoned rather than locally repaired; and complex but informative hypotheses may be lost under short-term fitness or length bias. These limitations suggest that reliable LLM-based equation discovery should be organized as a multi-role reflective agent workflow, where generation, evaluation, critique, repair, and memory updating are distinct but coordinated roles.
@@ -36,7 +36,7 @@ As illustrated in the motivation figure, current generation-centered pipelines u
 ## Framework
 
 <p align="center">
-  <img src="./fig/framework.png" alt="STRIDE framework" width="100%">
+  <img src="./fig/framework.png" alt="STRIDE framework" width="70%">
 </p>
 
 STRIDE organizes automatic equation discovery into four coordinated roles:
