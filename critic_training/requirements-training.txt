@@ -1,0 +1,9 @@
+# Install in a separate Python 3.11 training environment; see README.
+-r requirements-data.txt
+transformers==4.57.1
+trl==0.24.0
+peft==0.17.1
+accelerate==1.11.0
+datasets==4.0.0
+# Install a suitable CUDA build of PyTorch and LLaMA-Factory separately.
+# The recorded server used torch 2.10.0 and LLaMA-Factory 0.9.5.dev0.

@@ -145,9 +145,11 @@ python codes/main.py --use_api True --api_model "gpt-5.1" \
 | Physical oscillator | `benchmark_dr/lsr_synth/phys_osc/PO14` | `specs/benchmark/specification_PO.txt` |
 | Materials science | `benchmark_dr/lsr_synth/matsci/MatSci3` | `specs/benchmark/specification_MatSci.txt` |
 
-More runnable examples are collected in `run_llmsr.sh`.
+More runnable examples are collected in `run_stride.sh`.
 
 ## Project Layout
+
+Critic SFT/DPO training code and instructions are available in [critic_training](critic_training/README.md), including data preparation, execution rewards, preference screening, and portable LLaMA-Factory configurations. This source-only release does not bundle experiment logs or model weights.
 
 | Path | Role |
 | --- | --- |

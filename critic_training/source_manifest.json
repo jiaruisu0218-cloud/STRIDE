@@ -1,0 +1,47 @@
+{
+  "versions": {
+    "torch": "2.10.0",
+    "transformers": "4.57.1",
+    "trl": "0.24.0",
+    "peft": "0.17.1",
+    "accelerate": "1.11.0",
+    "llamafactory": "0.9.5.dev0",
+    "numpy": "2.4.1",
+    "scipy": "1.17.1",
+    "datasets": "4.0.0"
+  },
+  "files": {
+    "critic_sft/prepare_data.py": "cbe93abf58238ad97b5db6bc372ec3902dcd860256a2a0708bb4794ec257a12e",
+    "critic_sft/expand_data.py": "686d31f31425c0af11df66f9c0575cc109ccfe771df2add7b25ef0bc4e6f1213",
+    "critic_sft/test_expand_data.py": "92a60a865248bb392247fec52e618f94c6dc63e7a59d2a2c0351b850e83803a5",
+    "critic_sft/run_v3/train.yaml": "65e0a0c12a7f3199a809096e958b92865397cab1d6ccc6e0bc43c0cdfe9cf530",
+    "critic_dpo_1k/train.yaml": "dc6ac88a6ee5e082307d58218f593fafb842a187191a379a3e7c806a37aff008",
+    "critic_dpo_1k/reward.py": "8dc93a7d8ae1db112b596e38ee9c291ca9e1b681fb865855246f3bea7afcddb9",
+    "critic_dpo_1k/sampling.py": "fe38754bead936970d56480d60ec736b0f88c154b24bf44d36a11694cb9706a7",
+    "critic_dpo_1k/pipeline.py": "db71bf0c92694b2f128895ba78732ba17abf9826df94de7729399da1a0f50bb1",
+    "critic_dpo_1k/test_collection.py": "77b9c898530feb7ccca485e963e93ea67d3d4bc50dd455755ddee1ea8532d88f",
+    "dpo_log/collect_critic_tasks.py": "1280a9c1e27116e9f48a267315227f14b73f8eaac118edb6356fce0c85460001"
+  },
+  "origin": "Code exported from the completed critic training experiments on 2026-09-21.",
+  "note": "Hashes identify the original normalized UTF-8 source, before portability edits. No logs, datasets or weights are included.",
+  "release_mapping": {
+    "critic_sft/prepare_data.py": "prepare_data.py",
+    "critic_sft/expand_data.py": "expand_data.py",
+    "critic_sft/test_expand_data.py": "tests/test_expand_data.py",
+    "critic_dpo_1k/reward.py": "reward.py",
+    "critic_dpo_1k/sampling.py": "sampling.py",
+    "critic_sft/run_v3/train.yaml": "configs/sft.yaml",
+    "critic_dpo_1k/train.yaml": "configs/dpo.yaml"
+  },
+  "extracted_functions": {
+    "preference_rules.py": [
+      "discovery_ok",
+      "validate_pair"
+    ],
+    "fit_worker.py": [
+      "clean",
+      "dump",
+      "worker"
+    ]
+  }
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run from repository root:  bash run_llmsr.sh
+# Run from repository root:  bash run_stride.sh
 # Entry point: codes/main.py (adds repo root to PYTHONPATH).
 # Conda env (match README / environment.yml):  conda activate stride
 #

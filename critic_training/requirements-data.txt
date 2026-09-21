@@ -1,0 +1,4 @@
+# Lightweight data processing and tests (no GPU required).
+numpy>=1.26,<3
+scipy>=1.11,<2
+PyYAML>=6,<7

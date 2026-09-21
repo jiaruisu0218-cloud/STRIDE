@@ -1,0 +1,8 @@
+data/
+outputs/
+prepared_configs/
+__pycache__/
+*.log
+*.safetensors
+*.bin
+*.pt
